@@ -883,8 +883,9 @@
         // ===== API CONFIGURATION =====
         const API_CONFIG = {
             token: 'sk_eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJfaWQiOiI2OTVlNjc2ZTQ1OTcyNjAwN2Y1MzM0MTEiLCJuYW1lIjoiZy05OTIxNTU0NEBtb2UtZGwuZWR1Lm15Iiwicm9sZSI6ImNvaW4iLCJpYXQiOjE3NzA3NDUyNDR9.Fqz-lv_TX9L_24EgmRq_sU2rDhkzuTuhNLBF17RoFwI',
-            generateEndpoint: 'https://api.a2e.ai/v1/images/generate',
-            editEndpoint: 'https://api.a2e.ai/v1/images/edit'
+            baseUrl: 'https://video.a2e.ai',
+            generateEndpoint: 'https://video.a2e.ai/api/v1/userText2image/start',
+            editEndpoint: 'https://video.a2e.ai/api/v1/userImage2image/start' // Image editing endpoint (trying likely pattern)
         };
 
         // ===== GLOBAL STATE =====
@@ -979,6 +980,9 @@
             document.getElementById('generateBtn').disabled = true;
 
             try {
+                // Parse resolution into width and height
+                const [width, height] = resolution.split('x').map(Number);
+
                 const promises = [];
                 for (let i = 0; i < selectedNumberGenerate; i++) {
                     promises.push(
@@ -989,8 +993,11 @@
                                 'Content-Type': 'application/json'
                             },
                             body: JSON.stringify({
+                                name: `Image_${Date.now()}_${i}`,
                                 prompt: prompt,
-                                size: resolution
+                                req_key: 'high_aes_general_v21_L', // General Style
+                                width: width,
+                                height: height
                             })
                         })
                     );
@@ -1001,10 +1008,19 @@
 
                 for (const response of responses) {
                     if (!response.ok) {
-                        throw new Error(`API Error: ${response.status}`);
+                        const errorText = await response.text();
+                        throw new Error(`API Error: ${response.status} - ${errorText}`);
                     }
                     const data = await response.json();
-                    const imageUrl = data.url || data.image_url || data.data?.[0]?.url || data.images?.[0]?.url;
+                    console.log('API Response:', data);
+
+                    // A2E returns data in different formats, try multiple paths
+                    const imageUrl = data.data?.img_url ||
+                                   data.data?.image_url ||
+                                   data.url ||
+                                   data.image_url ||
+                                   data.data?.[0]?.url ||
+                                   data.images?.[0]?.url;
                     if (imageUrl) {
                         results.push(imageUrl);
                     }
@@ -1048,32 +1064,82 @@
 
             try {
                 const base64Image = await fileToBase64(sourceFile);
-                
-                const response = await fetch(API_CONFIG.editEndpoint, {
-                    method: 'POST',
-                    headers: {
-                        'Authorization': `Bearer ${API_CONFIG.token}`,
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({
-                        image: base64Image,
-                        prompt: prompt,
-                        num_images: selectedNumberEdit
-                    })
-                });
+                console.log('Source image converted to base64');
 
-                if (!response.ok) {
-                    throw new Error(`API Error: ${response.status}`);
+                // Try multiple possible endpoint formats
+                const endpoints = [
+                    {
+                        url: 'https://video.a2e.ai/api/v1/userImage2image/start',
+                        payload: {
+                            name: `Edit_${Date.now()}`,
+                            prompt: prompt,
+                            image: base64Image,
+                            num_images: selectedNumberEdit,
+                            req_key: 'high_aes_general_v21_L'
+                        }
+                    },
+                    {
+                        url: 'https://video.a2e.ai/api/v1/userText2image/start',
+                        payload: {
+                            name: `Edit_${Date.now()}`,
+                            prompt: prompt,
+                            req_key: 'high_aes_general_v21_L',
+                            width: 1024,
+                            height: 1024,
+                            reference_image: base64Image
+                        }
+                    }
+                ];
+
+                let response;
+                let lastError;
+
+                for (const endpoint of endpoints) {
+                    try {
+                        console.log(`Trying endpoint: ${endpoint.url}`);
+                        response = await fetch(endpoint.url, {
+                            method: 'POST',
+                            headers: {
+                                'Authorization': `Bearer ${API_CONFIG.token}`,
+                                'Content-Type': 'application/json'
+                            },
+                            body: JSON.stringify(endpoint.payload)
+                        });
+
+                        if (response.ok) {
+                            console.log('Request successful!');
+                            break;
+                        } else {
+                            const errorText = await response.text();
+                            console.log(`Endpoint ${endpoint.url} failed: ${response.status} - ${errorText}`);
+                            lastError = new Error(`API Error: ${response.status} - ${errorText}`);
+                        }
+                    } catch (error) {
+                        console.log(`Endpoint ${endpoint.url} error:`, error);
+                        lastError = error;
+                    }
+                }
+
+                if (!response || !response.ok) {
+                    throw lastError || new Error('All endpoints failed. A2E may not support image editing yet. Try using text-to-image generation instead, or contact A2E support for image editing API access.');
                 }
 
                 const data = await response.json();
-                const results = data.images || data.data || [];
-                
+                console.log('API Response:', data);
+
+                // Try multiple possible response formats
+                const results = data.images ||
+                               data.data?.images ||
+                               (data.data?.img_url ? [data.data.img_url] : null) ||
+                               (data.data?.image_url ? [data.data.image_url] : null) ||
+                               (Array.isArray(data.data) ? data.data : null) ||
+                               [];
+
                 if (results.length > 0) {
                     displayResults('editResults', results, prompt);
                     addToHistory(results, prompt, 'edit');
                 } else {
-                    throw new Error('No images returned from API');
+                    throw new Error('No images returned from API. Response: ' + JSON.stringify(data));
                 }
 
             } catch (error) {
