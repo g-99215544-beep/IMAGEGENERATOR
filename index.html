@@ -1012,17 +1012,41 @@
                         throw new Error(`API Error: ${response.status} - ${errorText}`);
                     }
                     const data = await response.json();
-                    console.log('API Response:', data);
+                    console.log('Full API Response:', JSON.stringify(data, null, 2));
 
-                    // A2E returns data in different formats, try multiple paths
-                    const imageUrl = data.data?.img_url ||
-                                   data.data?.image_url ||
-                                   data.url ||
-                                   data.image_url ||
-                                   data.data?.[0]?.url ||
-                                   data.images?.[0]?.url;
-                    if (imageUrl) {
-                        results.push(imageUrl);
+                    // Check if A2E returns a task_id (async processing)
+                    if (data.data?.task_id || data.task_id) {
+                        const taskId = data.data?.task_id || data.task_id;
+                        console.log('Task created, polling for result:', taskId);
+
+                        // Poll for task completion
+                        const imageUrl = await pollTaskStatus(taskId);
+                        if (imageUrl) {
+                            results.push(imageUrl);
+                        }
+                    } else {
+                        // Try to extract image URL directly from response
+                        const imageUrl = data.data?.img_url ||
+                                       data.data?.image_url ||
+                                       data.data?.url ||
+                                       data.url ||
+                                       data.image_url ||
+                                       data.img_url ||
+                                       data.data?.[0]?.img_url ||
+                                       data.data?.[0]?.url ||
+                                       data.images?.[0]?.url ||
+                                       data.images?.[0];
+
+                        console.log('Extracted image URL:', imageUrl);
+
+                        if (imageUrl) {
+                            results.push(imageUrl);
+                        } else {
+                            console.error('Could not find image URL in response. Response keys:', Object.keys(data));
+                            if (data.data) {
+                                console.error('data.data keys:', Object.keys(data.data));
+                            }
+                        }
                     }
                 }
 
@@ -1030,7 +1054,7 @@
                     displayResults('generateResults', results, prompt);
                     addToHistory(results, prompt, 'generate');
                 } else {
-                    throw new Error('No images returned from API');
+                    throw new Error('No images returned from API. Check console for response details.');
                 }
 
             } catch (error) {
@@ -1125,21 +1149,55 @@
                 }
 
                 const data = await response.json();
-                console.log('API Response:', data);
+                console.log('Full Edit API Response:', JSON.stringify(data, null, 2));
 
-                // Try multiple possible response formats
-                const results = data.images ||
-                               data.data?.images ||
-                               (data.data?.img_url ? [data.data.img_url] : null) ||
-                               (data.data?.image_url ? [data.data.image_url] : null) ||
-                               (Array.isArray(data.data) ? data.data : null) ||
-                               [];
+                const results = [];
+
+                // Check if A2E returns a task_id (async processing)
+                if (data.data?.task_id || data.task_id) {
+                    const taskId = data.data?.task_id || data.task_id;
+                    console.log('Edit task created, polling for result:', taskId);
+
+                    // Poll for task completion
+                    const imageUrl = await pollTaskStatus(taskId);
+                    if (imageUrl) {
+                        results.push(imageUrl);
+                    }
+                } else {
+                    // Try to extract image URLs directly from response
+                    if (data.images && Array.isArray(data.images)) {
+                        results.push(...data.images);
+                    } else if (data.data?.images && Array.isArray(data.data.images)) {
+                        results.push(...data.data.images);
+                    } else if (Array.isArray(data.data)) {
+                        results.push(...data.data);
+                    } else {
+                        // Try single image URL
+                        const imageUrl = data.data?.img_url ||
+                                       data.data?.image_url ||
+                                       data.data?.url ||
+                                       data.url ||
+                                       data.image_url ||
+                                       data.img_url;
+
+                        console.log('Extracted edit image URL:', imageUrl);
+
+                        if (imageUrl) {
+                            results.push(imageUrl);
+                        } else {
+                            console.error('Could not find image URL in response. Response keys:', Object.keys(data));
+                            if (data.data) {
+                                console.error('data.data keys:', Object.keys(data.data));
+                            }
+                        }
+                    }
+                }
 
                 if (results.length > 0) {
                     displayResults('editResults', results, prompt);
                     addToHistory(results, prompt, 'edit');
                 } else {
-                    throw new Error('No images returned from API. Response: ' + JSON.stringify(data));
+                    throw new Error('No images returned from API. Check console for response details.');
                 }
 
             } catch (error) {
@@ -1152,6 +1210,64 @@
         }
 
         // ===== HELPER FUNCTIONS =====
+        async function pollTaskStatus(taskId, maxAttempts = 30, interval = 2000) {
+            // Poll the task status endpoint to check if image generation is complete
+            const statusUrl = `${API_CONFIG.baseUrl}/api/v1/userTask/query?task_id=${taskId}`;
+
+            for (let attempt = 0; attempt < maxAttempts; attempt++) {
+                try {
+                    console.log(`Polling attempt ${attempt + 1}/${maxAttempts} for task ${taskId}`);
+
+                    const response = await fetch(statusUrl, {
+                        method: 'GET',
+                        headers: {
+                            'Authorization': `Bearer ${API_CONFIG.token}`,
+                            'Content-Type': 'application/json'
+                        }
+                    });
+
+                    if (response.ok) {
+                        const data = await response.json();
+                        console.log('Task status response:', JSON.stringify(data, null, 2));
+
+                        // Check if task is complete
+                        const status = data.data?.status || data.status;
+
+                        if (status === 'completed' || status === 'success' || status === 'done') {
+                            // Extract image URL from completed task
+                            const imageUrl = data.data?.img_url ||
+                                           data.data?.image_url ||
+                                           data.data?.url ||
+                                           data.data?.result?.img_url ||
+                                           data.data?.result?.url ||
+                                           data.img_url ||
+                                           data.image_url ||
+                                           data.url;
+
+                            if (imageUrl) {
+                                console.log('Task completed! Image URL:', imageUrl);
+                                return imageUrl;
+                            }
+                        } else if (status === 'failed' || status === 'error') {
+                            console.error('Task failed:', data);
+                            return null;
+                        }
+
+                        // Task still processing, wait and retry
+                        console.log(`Task status: ${status}, waiting ${interval}ms...`);
+                    }
+                } catch (error) {
+                    console.error('Error polling task status:', error);
+                }
+
+                // Wait before next poll
+                await new Promise(resolve => setTimeout(resolve, interval));
+            }
+
+            console.error('Task polling timed out after', maxAttempts, 'attempts');
+            return null;
+        }
+
         function fileToBase64(file) {
             return new Promise((resolve, reject) => {
                 const reader = new FileReader();
