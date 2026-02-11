@@ -983,69 +983,96 @@
                 // Parse resolution into width and height
                 const [width, height] = resolution.split('x').map(Number);
 
-                const promises = [];
-                for (let i = 0; i < selectedNumberGenerate; i++) {
-                    promises.push(
-                        fetch(API_CONFIG.generateEndpoint, {
-                            method: 'POST',
-                            headers: {
-                                'Authorization': `Bearer ${API_CONFIG.token}`,
-                                'Content-Type': 'application/json'
-                            },
-                            body: JSON.stringify({
-                                name: `Image_${Date.now()}_${i}`,
-                                prompt: prompt,
-                                req_key: 'high_aes_general_v21_L', // General Style
-                                width: width,
-                                height: height
-                            })
-                        })
-                    );
+                // Get model type (convert UI model names to API model_type)
+                const modelSelect = document.getElementById('generateModel').value;
+                const modelType = modelSelect === 'A2E' ? 'a2e' :
+                                 modelSelect === 'SDXL' ? 'a2e' :
+                                 modelSelect === 'Flux' ? 'seedream' : 'a2e';
+
+                // Build request payload according to API spec
+                const payload = {
+                    name: `Generated_${new Date().toISOString().slice(0,19).replace('T', ' ')}`,
+                    prompt: prompt,
+                    width: width,
+                    height: height,
+                    model_type: modelType,
+                    max_images: selectedNumberGenerate
+                };
+
+                console.log('Sending request with payload:', JSON.stringify(payload, null, 2));
+
+                const response = await fetch(API_CONFIG.generateEndpoint, {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${API_CONFIG.token}`,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(payload)
+                });
+
+                if (!response.ok) {
+                    const errorText = await response.text();
+                    throw new Error(`API Error: ${response.status} - ${errorText}`);
                 }
 
-                const responses = await Promise.all(promises);
+                const data = await response.json();
+                console.log('Full API Response:', JSON.stringify(data, null, 2));
+
+                // Check response code
+                if (data.code !== 0) {
+                    throw new Error(data.message || 'Request failed');
+                }
+
                 const results = [];
 
-                for (const response of responses) {
-                    if (!response.ok) {
-                        const errorText = await response.text();
-                        throw new Error(`API Error: ${response.status} - ${errorText}`);
+                // API returns task_id(s) that need to be polled
+                // With max_images, it may return multiple task IDs or a single task
+                if (data.data?.task_id || data.task_id) {
+                    const taskId = data.data?.task_id || data.task_id;
+                    console.log('Task created, polling for result:', taskId);
+
+                    // Poll for task completion
+                    const imageUrls = await pollTaskStatus(taskId);
+                    if (imageUrls) {
+                        // pollTaskStatus might return single URL or array
+                        if (Array.isArray(imageUrls)) {
+                            results.push(...imageUrls);
+                        } else {
+                            results.push(imageUrls);
+                        }
                     }
-                    const data = await response.json();
-                    console.log('Full API Response:', JSON.stringify(data, null, 2));
+                } else if (data.data?.task_ids && Array.isArray(data.data.task_ids)) {
+                    // Multiple tasks created (when max_images > 1)
+                    console.log('Multiple tasks created:', data.data.task_ids.length);
 
-                    // Check if A2E returns a task_id (async processing)
-                    if (data.data?.task_id || data.task_id) {
-                        const taskId = data.data?.task_id || data.task_id;
-                        console.log('Task created, polling for result:', taskId);
-
-                        // Poll for task completion
+                    for (const taskId of data.data.task_ids) {
                         const imageUrl = await pollTaskStatus(taskId);
                         if (imageUrl) {
-                            results.push(imageUrl);
-                        }
-                    } else {
-                        // Try to extract image URL directly from response
-                        const imageUrl = data.data?.img_url ||
-                                       data.data?.image_url ||
-                                       data.data?.url ||
-                                       data.url ||
-                                       data.image_url ||
-                                       data.img_url ||
-                                       data.data?.[0]?.img_url ||
-                                       data.data?.[0]?.url ||
-                                       data.images?.[0]?.url ||
-                                       data.images?.[0];
-
-                        console.log('Extracted image URL:', imageUrl);
-
-                        if (imageUrl) {
-                            results.push(imageUrl);
-                        } else {
-                            console.error('Could not find image URL in response. Response keys:', Object.keys(data));
-                            if (data.data) {
-                                console.error('data.data keys:', Object.keys(data.data));
+                            if (Array.isArray(imageUrl)) {
+                                results.push(...imageUrl);
+                            } else {
+                                results.push(imageUrl);
                             }
+                        }
+                    }
+                } else {
+                    // Try to extract image URL directly from response (unlikely for this API)
+                    const imageUrl = data.data?.img_url ||
+                                   data.data?.image_url ||
+                                   data.data?.url ||
+                                   data.url ||
+                                   data.image_url ||
+                                   data.img_url;
+
+                    console.log('Extracted image URL:', imageUrl);
+
+                    if (imageUrl) {
+                        results.push(imageUrl);
+                    } else {
+                        console.error('Could not find task_id or image URL in response');
+                        console.error('Response keys:', Object.keys(data));
+                        if (data.data) {
+                            console.error('data.data keys:', Object.keys(data.data));
                         }
                     }
                 }
@@ -1070,7 +1097,8 @@
         async function editImages() {
             const prompt = document.getElementById('editPrompt').value.trim();
             const sourceFile = document.getElementById('sourceImage').files[0];
-            
+            const referenceFile = document.getElementById('referenceImage').files[0];
+
             if (!prompt) {
                 showError('editError', 'Please enter editing instructions!');
                 return;
@@ -1087,109 +1115,109 @@
             document.getElementById('editBtn').disabled = true;
 
             try {
-                const base64Image = await fileToBase64(sourceFile);
-                console.log('Source image converted to base64');
+                // Convert images to data URLs (base64 with data: prefix)
+                const sourceDataURL = await fileToDataURL(sourceFile);
+                console.log('Source image converted to data URL');
 
-                // Try multiple possible endpoint formats
-                const endpoints = [
-                    {
-                        url: 'https://video.a2e.ai/api/v1/userImage2image/start',
-                        payload: {
-                            name: `Edit_${Date.now()}`,
-                            prompt: prompt,
-                            image: base64Image,
-                            num_images: selectedNumberEdit,
-                            req_key: 'high_aes_general_v21_L'
-                        }
-                    },
-                    {
-                        url: 'https://video.a2e.ai/api/v1/userText2image/start',
-                        payload: {
-                            name: `Edit_${Date.now()}`,
-                            prompt: prompt,
-                            req_key: 'high_aes_general_v21_L',
-                            width: 1024,
-                            height: 1024,
-                            reference_image: base64Image
-                        }
-                    }
-                ];
+                // Get model type
+                const modelSelect = document.getElementById('editModel').value;
+                const modelType = modelSelect === 'A2E' ? 'a2e' :
+                                 modelSelect === 'SDXL' ? 'a2e' : 'a2e';
 
-                let response;
-                let lastError;
-
-                for (const endpoint of endpoints) {
-                    try {
-                        console.log(`Trying endpoint: ${endpoint.url}`);
-                        response = await fetch(endpoint.url, {
-                            method: 'POST',
-                            headers: {
-                                'Authorization': `Bearer ${API_CONFIG.token}`,
-                                'Content-Type': 'application/json'
-                            },
-                            body: JSON.stringify(endpoint.payload)
-                        });
-
-                        if (response.ok) {
-                            console.log('Request successful!');
-                            break;
-                        } else {
-                            const errorText = await response.text();
-                            console.log(`Endpoint ${endpoint.url} failed: ${response.status} - ${errorText}`);
-                            lastError = new Error(`API Error: ${response.status} - ${errorText}`);
-                        }
-                    } catch (error) {
-                        console.log(`Endpoint ${endpoint.url} error:`, error);
-                        lastError = error;
-                    }
+                // Get resolution
+                const resolution = document.getElementById('editResolution').value;
+                let width = 1024, height = 1024;
+                if (resolution === '1080P') {
+                    width = 1920; height = 1080;
+                } else if (resolution === '720P') {
+                    width = 1280; height = 720;
+                } else if (resolution === '4K') {
+                    width = 3840; height = 2160;
                 }
 
-                if (!response || !response.ok) {
-                    throw lastError || new Error('All endpoints failed. A2E may not support image editing yet. Try using text-to-image generation instead, or contact A2E support for image editing API access.');
+                // Build input_images array
+                const inputImages = [sourceDataURL];
+
+                // Add reference image if provided
+                if (referenceFile) {
+                    const referenceDataURL = await fileToDataURL(referenceFile);
+                    inputImages.push(referenceDataURL);
+                    console.log('Reference image added to input_images');
+                }
+
+                // Build request payload - same endpoint as text2image!
+                const payload = {
+                    name: `Edit_${new Date().toISOString().slice(0,19).replace('T', ' ')}`,
+                    prompt: prompt,
+                    width: width,
+                    height: height,
+                    model_type: modelType,
+                    input_images: inputImages,
+                    max_images: selectedNumberEdit
+                };
+
+                console.log('Sending edit request with payload:', JSON.stringify({
+                    ...payload,
+                    input_images: `[${inputImages.length} images as data URLs]`
+                }, null, 2));
+
+                const response = await fetch(API_CONFIG.generateEndpoint, {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${API_CONFIG.token}`,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(payload)
+                });
+
+                if (!response.ok) {
+                    const errorText = await response.text();
+                    throw new Error(`API Error: ${response.status} - ${errorText}`);
                 }
 
                 const data = await response.json();
                 console.log('Full Edit API Response:', JSON.stringify(data, null, 2));
 
+                // Check response code
+                if (data.code !== 0) {
+                    throw new Error(data.message || 'Request failed');
+                }
+
                 const results = [];
 
-                // Check if A2E returns a task_id (async processing)
+                // API returns task_id(s) that need to be polled
                 if (data.data?.task_id || data.task_id) {
                     const taskId = data.data?.task_id || data.task_id;
                     console.log('Edit task created, polling for result:', taskId);
 
                     // Poll for task completion
-                    const imageUrl = await pollTaskStatus(taskId);
-                    if (imageUrl) {
-                        results.push(imageUrl);
-                    }
-                } else {
-                    // Try to extract image URLs directly from response
-                    if (data.images && Array.isArray(data.images)) {
-                        results.push(...data.images);
-                    } else if (data.data?.images && Array.isArray(data.data.images)) {
-                        results.push(...data.data.images);
-                    } else if (Array.isArray(data.data)) {
-                        results.push(...data.data);
-                    } else {
-                        // Try single image URL
-                        const imageUrl = data.data?.img_url ||
-                                       data.data?.image_url ||
-                                       data.data?.url ||
-                                       data.url ||
-                                       data.image_url ||
-                                       data.img_url;
-
-                        console.log('Extracted edit image URL:', imageUrl);
-
-                        if (imageUrl) {
-                            results.push(imageUrl);
+                    const imageUrls = await pollTaskStatus(taskId);
+                    if (imageUrls) {
+                        if (Array.isArray(imageUrls)) {
+                            results.push(...imageUrls);
                         } else {
-                            console.error('Could not find image URL in response. Response keys:', Object.keys(data));
-                            if (data.data) {
-                                console.error('data.data keys:', Object.keys(data.data));
+                            results.push(imageUrls);
+                        }
+                    }
+                } else if (data.data?.task_ids && Array.isArray(data.data.task_ids)) {
+                    // Multiple tasks created
+                    console.log('Multiple edit tasks created:', data.data.task_ids.length);
+
+                    for (const taskId of data.data.task_ids) {
+                        const imageUrl = await pollTaskStatus(taskId);
+                        if (imageUrl) {
+                            if (Array.isArray(imageUrl)) {
+                                results.push(...imageUrl);
+                            } else {
+                                results.push(imageUrl);
                             }
                         }
+                    }
+                } else {
+                    console.error('Could not find task_id in response');
+                    console.error('Response keys:', Object.keys(data));
+                    if (data.data) {
+                        console.error('data.data keys:', Object.keys(data.data));
                     }
                 }
 
@@ -1234,19 +1262,40 @@
                         const status = data.data?.status || data.status;
 
                         if (status === 'completed' || status === 'success' || status === 'done') {
-                            // Extract image URL from completed task
-                            const imageUrl = data.data?.img_url ||
-                                           data.data?.image_url ||
-                                           data.data?.url ||
-                                           data.data?.result?.img_url ||
-                                           data.data?.result?.url ||
-                                           data.img_url ||
-                                           data.image_url ||
-                                           data.url;
+                            // Extract image URLs from completed task (might be multiple)
+                            const results = [];
 
-                            if (imageUrl) {
-                                console.log('Task completed! Image URL:', imageUrl);
-                                return imageUrl;
+                            // Check for array of images
+                            if (data.data?.images && Array.isArray(data.data.images)) {
+                                results.push(...data.data.images);
+                            } else if (data.data?.result?.images && Array.isArray(data.data.result.images)) {
+                                results.push(...data.data.result.images);
+                            } else if (data.images && Array.isArray(data.images)) {
+                                results.push(...data.images);
+                            } else {
+                                // Check for single image URL
+                                const imageUrl = data.data?.img_url ||
+                                               data.data?.image_url ||
+                                               data.data?.url ||
+                                               data.data?.result?.img_url ||
+                                               data.data?.result?.image_url ||
+                                               data.data?.result?.url ||
+                                               data.img_url ||
+                                               data.image_url ||
+                                               data.url;
+
+                                if (imageUrl) {
+                                    results.push(imageUrl);
+                                }
+                            }
+
+                            if (results.length > 0) {
+                                console.log(`Task completed! Found ${results.length} image(s)`);
+                                return results.length === 1 ? results[0] : results;
+                            } else {
+                                console.error('Task completed but no images found in response');
+                                console.error('Response structure:', data);
+                                return null;
                             }
                         } else if (status === 'failed' || status === 'error') {
                             console.error('Task failed:', data);
@@ -1272,6 +1321,15 @@
             return new Promise((resolve, reject) => {
                 const reader = new FileReader();
                 reader.onload = () => resolve(reader.result.split(',')[1]);
+                reader.onerror = reject;
+                reader.readAsDataURL(file);
+            });
+        }
+
+        function fileToDataURL(file) {
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = () => resolve(reader.result); // Returns full data URL with data:image/...;base64,
                 reader.onerror = reject;
                 reader.readAsDataURL(file);
             });
